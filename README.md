@@ -142,6 +142,21 @@ npm install
 npm start
 ```
 
+## 测试
+
+```bash
+npm test            # 求解器单元测试 + 浏览器回归测试
+npm run test:solver # 仅求解器单元测试（纯 Node，无额外依赖）
+npm run test:browser# 仅浏览器回归测试（Playwright + Chromium）
+```
+
+浏览器回归测试需要真实 Chromium，首次运行前执行一次
+`npm install && npx playwright install chromium`（如系统缺少运行库，
+再执行 `npx playwright install --with-deps chromium`）。测试覆盖：
+粘贴/文件导入含未知视型的 JSON 时错误提示持续可见且求解禁用、修正后清错恢复、
+示例请求与求解响应的异步乱序丢弃、服务端 400 错误可见性等前端状态提交行为。
+测试服务使用独立端口（默认 3100，可用 `TEST_PORT` 覆盖），不影响 3000 端口。
+
 ## 项目结构
 
 ```
@@ -152,7 +167,7 @@ src/solver.js           # 输入校验 + 分支定界搜索 + 锁定冲突诊断
 src/server.js           # Express 服务与 /api/solve
 public/                 # 原生前端（HTML/CSS/JS）
 examples/               # 示例数据
-scripts/                # 求解器测试与样例验证脚本
+scripts/                # 求解器测试、浏览器回归测试与样例验证脚本
 ```
 
 ## 隐私

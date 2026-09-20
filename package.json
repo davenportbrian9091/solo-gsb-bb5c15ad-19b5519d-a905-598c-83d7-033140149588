@@ -8,9 +8,15 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node scripts/test-solver.js && node scripts/test-browser.js",
+    "test:solver": "node scripts/test-solver.js",
+    "test:browser": "node scripts/test-browser.js"
   },
   "dependencies": {
     "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
   }
 }

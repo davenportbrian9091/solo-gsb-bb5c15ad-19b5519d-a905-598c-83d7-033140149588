@@ -29,6 +29,12 @@ const els = {
 let parsed = null; // 最近一次成功解析的 JSON 对象
 let lastExport = null; // 最近一次最优解的导出对象
 
+// 前端状态版本号：每次提交输入/使结果失效时单调递增。
+// 文件读取、示例请求、求解等异步操作在开始时记录当前版本号，
+// 完成时若版本号已变化（说明期间有更新的输入提交），则丢弃结果，
+// 保证较早开始的异步响应永远不会覆盖更新后的输入。
+let stateVersion = 0;
+
 const LIMITS = { tokens: 10, candidates: 12, constraints: 30 };
 
 // 色觉鲁棒模式支持的视型（与服务端一致）。
@@ -40,35 +46,46 @@ const PROFILE_LABELS = {
   tritanopia: 'tritanopia（蓝黄色盲）',
 };
 
-// ---------- 解析与锁定面板 ----------
+// ---------- 解析与状态提交 ----------
 
-function parseTextarea() {
+// 纯解析：读取 textarea 文本并校验，返回 { data, error }，不触碰任何 UI 状态。
+function parseInputText() {
   const text = els.jsonInput.value.trim();
-  els.parseError.hidden = true;
-  if (!text) {
-    parsed = null;
-    refreshLockPanel();
-    return null;
-  }
+  if (!text) return { data: null, error: null };
   let data;
   try {
     data = JSON.parse(text);
   } catch (err) {
-    showParseError('JSON 语法错误：' + err.message);
-    parsed = null;
-    refreshLockPanel();
-    return null;
+    return { data: null, error: 'JSON 语法错误：' + err.message };
   }
   const problem = validateShape(data);
-  if (problem) {
-    showParseError(problem);
-    parsed = null;
-    refreshLockPanel();
-    return null;
-  }
+  if (problem) return { data: null, error: problem };
+  return { data, error: null };
+}
+
+// 统一的状态提交入口：文本输入、文件导入、示例载入与求解前校验都经由此处。
+// 顺序固定为：递增版本号（使进行中的异步操作过期）→ 清理旧结果 →
+// 原子更新 parsed、错误可见性、锁定/视型面板与求解按钮。
+// 无效输入会持续显示具体错误并禁用求解，修正后自动清错并恢复面板。
+function commitInput() {
+  stateVersion++;
+  const { data, error } = parseInputText();
+  clearResults();
   parsed = data;
+  if (error) {
+    showParseError(error);
+  } else {
+    els.parseError.hidden = true;
+  }
   refreshLockPanel();
   return data;
+}
+
+// 锁定勾选等直接修改 parsed 的轻量变更：仅递增版本号并清理旧结果，
+// 不重新解析、不重建面板（避免打断勾选操作），同时使进行中的求解响应过期。
+function invalidateResults() {
+  stateVersion++;
+  clearResults();
 }
 
 function showParseError(msg) {
@@ -161,6 +178,8 @@ function refreshLockPanel() {
       item.classList.toggle('is-locked', cb.checked);
       // 锁定状态同步回文本框中的 JSON。
       syncParsedIntoText();
+      // 锁定变化会使旧结果与进行中的求解过期。
+      invalidateResults();
     });
 
     const swatch = document.createElement('span');
@@ -221,7 +240,6 @@ function refreshProfilePanel() {
         showParseError('至少保留一个视型；不提供 profiles 字段时默认仅 normal。');
         return;
       }
-      els.parseError.hidden = true;
       // 以固定顺序写回 JSON（仅 normal 时移除该字段，回到缺省语义）。
       if (chosen.length === 1 && chosen[0] === 'normal') {
         delete parsed.profiles;
@@ -229,7 +247,7 @@ function refreshProfilePanel() {
         parsed.profiles = chosen;
       }
       syncParsedIntoText();
-      refreshProfilePanel();
+      commitInput();
     });
 
     const text = document.createElement('span');
@@ -251,16 +269,21 @@ function syncParsedIntoText() {
   }
 }
 
-// ---------- 文件导入 / 示例 ----------
+// ---------- 文件导入 / 示例 / 文本输入 ----------
+// 三个入口统一经 commitInput 提交状态；异步操作凭版本号防止乱序覆盖。
 
 els.fileInput.addEventListener('change', async (e) => {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
+  // 领取版本票据：使更早开始的异步操作（含求解）过期。
+  const ticket = ++stateVersion;
   try {
-    els.jsonInput.value = await file.text();
-    parseTextarea();
-    clearResults();
+    const text = await file.text();
+    if (ticket !== stateVersion) return; // 期间已有更新的输入，丢弃过期读取
+    els.jsonInput.value = text;
+    commitInput();
   } catch (err) {
+    if (ticket !== stateVersion) return;
     showParseError('读取文件失败：' + err.message);
   } finally {
     els.fileInput.value = '';
@@ -268,33 +291,36 @@ els.fileInput.addEventListener('change', async (e) => {
 });
 
 els.loadSampleBtn.addEventListener('click', async () => {
+  const ticket = ++stateVersion;
   try {
     const res = await fetch('/sample-palette.json');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
+    if (ticket !== stateVersion) return; // 期间已有更新的输入，丢弃过期响应
     els.jsonInput.value = JSON.stringify(data, null, 2);
-    parseTextarea();
-    clearResults();
+    commitInput();
   } catch (err) {
+    if (ticket !== stateVersion) return;
     showParseError('载入示例失败：' + err.message);
   }
 });
 
 els.jsonInput.addEventListener('input', () => {
-  parseTextarea();
-  clearResults();
+  commitInput();
 });
 
 // ---------- 求解 ----------
 
 els.solveBtn.addEventListener('click', async () => {
-  const data = parseTextarea();
+  // 求解前重新提交当前输入：无效输入会持续显示错误并保持按钮禁用。
+  const data = commitInput();
   if (!data) return;
 
   const locks = {};
   for (const t of data.tokens) locks[t.name] = t.locked === true;
 
-  clearResults();
+  // 领取版本票据：求解期间若有更新的输入提交，本次响应将被丢弃。
+  const ticket = stateVersion;
   els.solveBtn.disabled = true;
   els.resultPlaceholder.innerHTML = '<span class="spinner"></span>正在进行全局分支定界搜索…';
   els.resultPlaceholder.hidden = false;
@@ -306,27 +332,35 @@ els.solveBtn.addEventListener('click', async () => {
       body: JSON.stringify({ payload: data, locks }),
     });
     const body = await res.json();
+    if (ticket !== stateVersion) return; // 输入已更新，丢弃过期响应
     if (!res.ok) {
       els.resultPlaceholder.hidden = true;
+      // 服务端 400 等错误持续可见，直到下一次输入提交。
       showParseError(body.error || '求解失败');
       return;
     }
     renderResult(body);
   } catch (err) {
+    if (ticket !== stateVersion) return;
     els.resultPlaceholder.hidden = true;
     showParseError('请求本地服务失败：' + err.message);
   } finally {
-    els.solveBtn.disabled = false;
+    // 仅当本次求解仍是最新状态时恢复按钮；
+    // 否则按钮状态由更新的提交（可能因输入无效而禁用）决定。
+    if (ticket === stateVersion) {
+      els.solveBtn.disabled = false;
+    }
   }
 });
 
+// 仅清理求解结果区域；错误提示的可见性由 commitInput 统一管理，
+// 清理旧结果时绝不清除输入错误。
 function clearResults() {
   els.resultPlaceholder.hidden = false;
   els.resultPlaceholder.textContent = '运行求解后在此查看结果。';
   els.resultArea.hidden = true;
   els.conflictArea.hidden = true;
   els.limitArea.hidden = true;
-  els.parseError.hidden = true;
   lastExport = null;
 }
 
@@ -547,5 +581,4 @@ els.exportBtn.addEventListener('click', () => {
 
 // ---------- 初始化 ----------
 
-refreshLockPanel();
-clearResults();
+commitInput();
