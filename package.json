@@ -8,9 +8,14 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node scripts/test-solver.js",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2"
   }
 }

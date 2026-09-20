@@ -142,6 +142,28 @@ npm install
 npm start
 ```
 
+### 测试
+
+- `npm test`：求解器行为测试（锁定冲突、色觉视型、决胜顺序、上限校验等，纯 Node）；
+- `npm run test:browser`：前端浏览器回归测试（[Playwright](https://playwright.dev/)），
+  首次运行需先执行 `npx playwright install chromium` 安装测试浏览器。测试会临时用
+  **3100** 端口启动同一份 `src/server.js`，不影响默认的 3000 端口与 Docker 启动方式。
+
+浏览器回归覆盖：含未知视型的合法 JSON 必须**持续显示具体错误并禁用求解按钮**、
+修正后清错恢复面板、服务端 400 错误保持可见，以及文件导入 / 示例载入 / 求解
+三类异步操作乱序返回时，较早开始的响应不得覆盖更新后的输入（版本化状态提交）。
+
+在无 root 的精简容器中运行浏览器测试时，可用 `PW_LD_LIBRARY_PATH` 指向预先
+解包的 Chromium 依赖库目录（无需写入系统路径；详见 `playwright.config.js`）：
+
+```bash
+# 可选：下载 deb 并解包到用户目录（Debian/Ubuntu）
+#   apt-get download <缺失的库包名...>
+#   for f in *.deb; do dpkg-deb -x "$f" deps-root/; done
+PW_LD_LIBRARY_PATH="$(find "$PWD/deps-root" -name '*.so*' -printf '%h\n' | sort -u | paste -sd: -)" \
+  npm run test:browser
+```
+
 ## 项目结构
 
 ```
@@ -153,6 +175,8 @@ src/server.js           # Express 服务与 /api/solve
 public/                 # 原生前端（HTML/CSS/JS）
 examples/               # 示例数据
 scripts/                # 求解器测试与样例验证脚本
+tests/browser/          # Playwright 浏览器回归测试（输入错误与异步乱序）
+playwright.config.js    # 浏览器测试配置（临时 3100 端口，不影响 3000）
 ```
 
 ## 隐私

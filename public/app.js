@@ -2,6 +2,12 @@
 
 // 对比度调色板求解器前端（原生 JS，无外部依赖）。
 // 页面只与同源的本机 Express 服务通信，数据不离开本机。
+//
+// 状态提交模型：输入、文件导入、示例载入与求解都通过 commitInput() 提交，
+// 每次提交分配严格递增的版本号；提交时先清理旧结果，再原子更新 parsed、
+// parseError 可见性、锁定/视型面板与求解按钮。异步流程（文件读取、示例
+// 请求、求解响应）完成时必须仍持有最新版本才允许写回，避免较早开始的
+// 异步操作覆盖更新后的输入（竞态乱序）。
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,6 +34,8 @@ const els = {
 
 let parsed = null; // 最近一次成功解析的 JSON 对象
 let lastExport = null; // 最近一次最优解的导出对象
+// 单调递增的前端状态版本号：每次新输入意图或求解开始时 +1。
+let inputVersion = 0;
 
 const LIMITS = { tokens: 10, candidates: 12, constraints: 30 };
 
@@ -40,41 +48,73 @@ const PROFILE_LABELS = {
   tritanopia: 'tritanopia（蓝黄色盲）',
 };
 
-// ---------- 解析与锁定面板 ----------
+// ---------- 版本化状态提交 ----------
 
-function parseTextarea() {
+// 开始一个新的输入意图（用户正在编辑/选择文件/点击示例）：分配新版本并
+// 立刻清理旧结果与错误。返回的版本号用于异步完成时校验是否仍为最新。
+function beginInput() {
+  inputVersion += 1;
+  clearResultViews();
+  return inputVersion;
+}
+
+function isCurrent(version) {
+  return version === inputVersion;
+}
+
+// 统一提交入口：解析当前 textarea，并原子更新全部派生视图。
+// 由输入、文件导入、示例载入、面板勾选与求解前校验共同使用。
+function commitInput() {
+  const result = evaluateInput();
+  applyCommit(result);
+  return result;
+}
+
+function evaluateInput() {
   const text = els.jsonInput.value.trim();
-  els.parseError.hidden = true;
-  if (!text) {
-    parsed = null;
-    refreshLockPanel();
-    return null;
-  }
+  if (!text) return { data: null, error: null };
   let data;
   try {
     data = JSON.parse(text);
   } catch (err) {
-    showParseError('JSON 语法错误：' + err.message);
-    parsed = null;
-    refreshLockPanel();
-    return null;
+    return { data: null, error: 'JSON 语法错误：' + err.message };
   }
   const problem = validateShape(data);
-  if (problem) {
-    showParseError(problem);
-    parsed = null;
-    refreshLockPanel();
-    return null;
+  if (problem) return { data: null, error: problem };
+  return { data, error: null };
+}
+
+// 先清理旧结果（在 commitInput 场景下通常已由 beginInput 完成），
+// 再原子写入 parsed、parseError、锁定/视型面板与求解按钮可用性。
+function applyCommit(result) {
+  clearResultViews();
+  parsed = result.data;
+  if (result.error) {
+    showParseError(result.error);
+  } else {
+    els.parseError.hidden = true;
+    els.parseError.textContent = '';
   }
-  parsed = data;
   refreshLockPanel();
-  return data;
 }
 
 function showParseError(msg) {
   els.parseError.textContent = msg;
   els.parseError.hidden = false;
 }
+
+// 仅清理结果区与旧的求解产物；parseError 由 applyCommit / 成功渲染统一管理，
+// 绝不在识别出无效输入后再被顺手隐藏。
+function clearResultViews() {
+  els.resultPlaceholder.hidden = false;
+  els.resultPlaceholder.textContent = '运行求解后在此查看结果。';
+  els.resultArea.hidden = true;
+  els.conflictArea.hidden = true;
+  els.limitArea.hidden = true;
+  lastExport = null;
+}
+
+// ---------- 前端校验 ----------
 
 // 轻量前端校验（服务端会做同样的严格校验，此处仅为提前反馈）。
 function validateShape(data) {
@@ -135,6 +175,8 @@ function validateShape(data) {
   return null;
 }
 
+// ---------- 锁定 / 视型面板 ----------
+
 function refreshLockPanel() {
   els.tokenLocks.innerHTML = '';
   els.solveBtn.disabled = !parsed;
@@ -157,10 +199,14 @@ function refreshLockPanel() {
     cb.checked = t.locked === true;
     cb.dataset.name = t.name;
     cb.addEventListener('change', () => {
+      if (!parsed) return;
       t.locked = cb.checked;
       item.classList.toggle('is-locked', cb.checked);
-      // 锁定状态同步回文本框中的 JSON。
+      // 锁定状态同步回文本框中的 JSON，并按新版本统一提交
+      // （若有求解在途，其响应会因版本过期而被丢弃）。
       syncParsedIntoText();
+      beginInput();
+      commitInput();
     });
 
     const swatch = document.createElement('span');
@@ -221,15 +267,16 @@ function refreshProfilePanel() {
         showParseError('至少保留一个视型；不提供 profiles 字段时默认仅 normal。');
         return;
       }
-      els.parseError.hidden = true;
-      // 以固定顺序写回 JSON（仅 normal 时移除该字段，回到缺省语义）。
+      // 以固定顺序写回 JSON（仅 normal 时移除该字段，回到缺省语义），
+      // 随后作为一次新版本的输入意图统一提交。
       if (chosen.length === 1 && chosen[0] === 'normal') {
         delete parsed.profiles;
       } else {
         parsed.profiles = chosen;
       }
       syncParsedIntoText();
-      refreshProfilePanel();
+      beginInput();
+      commitInput();
     });
 
     const text = document.createElement('span');
@@ -251,50 +298,67 @@ function syncParsedIntoText() {
   }
 }
 
-// ---------- 文件导入 / 示例 ----------
+// ---------- 文件导入 / 示例（异步，版本保护） ----------
 
 els.fileInput.addEventListener('change', async (e) => {
   const file = e.target.files && e.target.files[0];
+  // 无论后续读取成功与否，清空文件选择，避免同名文件无法再次触发 change。
+  els.fileInput.value = '';
   if (!file) return;
+  // 读取开始即占用新版本：读取期间的任何编辑都比该文件更新。
+  const version = beginInput();
   try {
-    els.jsonInput.value = await file.text();
-    parseTextarea();
-    clearResults();
+    const text = await file.text();
+    if (!isCurrent(version)) return; // 读取期间用户又改了输入，丢弃旧文件
+    els.jsonInput.value = text;
+    commitInput();
   } catch (err) {
+    if (!isCurrent(version)) return;
+    parsed = null;
+    clearResultViews();
     showParseError('读取文件失败：' + err.message);
-  } finally {
-    els.fileInput.value = '';
+    refreshLockPanel();
   }
 });
 
 els.loadSampleBtn.addEventListener('click', async () => {
+  // 点击即占用新版本；先给出加载提示。
+  const version = beginInput();
+  els.resultPlaceholder.textContent = '正在载入示例…';
   try {
     const res = await fetch('/sample-palette.json');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
+    if (!isCurrent(version)) return; // 较晚开始/更早返回的其他输入已生效
     els.jsonInput.value = JSON.stringify(data, null, 2);
-    parseTextarea();
-    clearResults();
+    commitInput();
   } catch (err) {
+    if (!isCurrent(version)) return;
+    parsed = null;
+    clearResultViews();
     showParseError('载入示例失败：' + err.message);
+    refreshLockPanel();
   }
 });
 
 els.jsonInput.addEventListener('input', () => {
-  parseTextarea();
-  clearResults();
+  beginInput();
+  commitInput();
 });
 
-// ---------- 求解 ----------
+// ---------- 求解（异步，版本保护） ----------
 
 els.solveBtn.addEventListener('click', async () => {
-  const data = parseTextarea();
+  // 求解前以当前文本做一次权威提交（错误须持续可见且禁用按钮）。
+  const committed = commitInput();
+  const data = committed.data;
   if (!data) return;
 
   const locks = {};
   for (const t of data.tokens) locks[t.name] = t.locked === true;
 
-  clearResults();
+  // 求解占用新版本：期间到达的输入会作废本次响应。
+  const version = beginInput();
   els.solveBtn.disabled = true;
   els.resultPlaceholder.innerHTML = '<span class="spinner"></span>正在进行全局分支定界搜索…';
   els.resultPlaceholder.hidden = false;
@@ -306,33 +370,29 @@ els.solveBtn.addEventListener('click', async () => {
       body: JSON.stringify({ payload: data, locks }),
     });
     const body = await res.json();
+    if (!isCurrent(version)) return; // 求解期间用户修改/重新导入了输入
     if (!res.ok) {
-      els.resultPlaceholder.hidden = true;
+      // 服务端 400（校验失败等）错误保持可见，直到下次有效提交。
+      clearResultViews();
       showParseError(body.error || '求解失败');
       return;
     }
     renderResult(body);
   } catch (err) {
-    els.resultPlaceholder.hidden = true;
+    if (!isCurrent(version)) return;
+    clearResultViews();
     showParseError('请求本地服务失败：' + err.message);
   } finally {
-    els.solveBtn.disabled = false;
+    if (isCurrent(version)) els.solveBtn.disabled = false;
   }
 });
-
-function clearResults() {
-  els.resultPlaceholder.hidden = false;
-  els.resultPlaceholder.textContent = '运行求解后在此查看结果。';
-  els.resultArea.hidden = true;
-  els.conflictArea.hidden = true;
-  els.limitArea.hidden = true;
-  els.parseError.hidden = true;
-  lastExport = null;
-}
 
 // ---------- 结果渲染 ----------
 
 function renderResult(body) {
+  // 成功渲染结果时清除任何残留错误（如之前的服务端 400）。
+  els.parseError.hidden = true;
+  els.parseError.textContent = '';
   els.resultPlaceholder.hidden = true;
 
   if (body.status === 'unsatisfiable') {
@@ -547,5 +607,4 @@ els.exportBtn.addEventListener('click', () => {
 
 // ---------- 初始化 ----------
 
-refreshLockPanel();
-clearResults();
+commitInput();
